@@ -1,0 +1,70 @@
+# 本地双卷印发校核（Dual Paper Check）
+
+一个完全本地运行的单选题双卷（A/B 卷）印发与答案校核网页：
+
+- **题库**：录入题干、四个选项并指定正确选项；每道题（`Q#`）和每个选项（`O#`）都有稳定标识。
+- **编排**：分别调整 A、B 卷的题序和每题四个选项的顺序，草稿可保存。
+- **封存**：A、B 两卷从同一题库修订封存为一个版本，封存时复制题干、选项、答案的**快照**。
+- **打印**：每个封存版本可分别打印 A/B 卷的**试卷、答题卡、答案表**；答题卡上的题号与选项字母与对应卷面完全一致。
+- **封存即冻结**：封存后再编辑题库，不改变任何已封存卷面和答题卡。
+- **勘误**：若发现答案错误，按封存题目和封存时印出的选项提交勘误：
+  - 同时更新 A、B 两卷答案表，记录各卷题号及勘误前后的选项字母；
+  - 选项不属于该封存题目、或任一卷缺少该题映射时，**整次拒绝，原答案不变**（事务保证）；
+  - 保留每次勘误记录，可随时回看。
+
+技术栈：Python Flask + SQLite（后端）、原生 JavaScript（前端，无构建步骤）、Gunicorn + Docker。
+
+## 一条命令启动
+
+需要本机已安装 Docker 与 Docker Compose 插件：
+
+```bash
+docker compose up -d --build
+```
+
+启动后在浏览器打开：
+
+**http://localhost:8000**
+
+端口为容器内 **8000**，已映射到宿主机同端口。停止：`docker compose down`（数据保留在 Docker 卷 `exam-data` 中）。
+
+如需更换宿主机端口，修改 `docker-compose.yml` 中的 `"8000:8000"` 左侧端口即可。
+
+## 页面与使用流程
+
+1. `题库`（`/#/questions`）：新增 / 编辑 / 删除单选题。已被封存引用的题目会显示提示——编辑只影响今后封存。
+2. `A/B 卷编排`（`/#/arrange`）：上下调整两卷题序；每题选项可下拉换位、一键顺移或恢复题库顺序；填备注后点“保存并封存新版本”。
+3. `封存卷与勘误`（`/#/seals`）：列出所有封存版本；点入后用标签页切换 A/B 卷的试卷、答题卡、答案表，点“打印 / 另存 PDF 当前页”输出。
+4. 在封存详情页的“勘误”标签中按封存题目 + 封存选项提交修正，可一次提交多条；成功后两卷答案表立即更新（带 `*` 标注勘误题），下方列出历次勘误（各卷题号、勘误前后字母、选项稳定标识）。
+
+## 本地直接运行（不用 Docker）
+
+```bash
+pip install -r requirements.txt
+python -m flask --app server.app run --host 0.0.0.0 --port 8000
+# 或：gunicorn -b 0.0.0.0:8000 server:app
+```
+
+数据库默认存于 `./data/exam.db`，可用环境变量 `DATABASE_PATH` 修改；首次启动自动建表。
+
+## 数据模型要点
+
+- `question / option / bank_answer`：现行题库与答案。
+- `paper_draft*`：A/B 卷编排草稿。
+- `seal / sealed_question / sealed_option`：封存版本及题干、选项、答案快照。
+- `paper / paper_question / paper_option`：封存卷中每题的题号（number）与选项字母（A–D），是卷面与答题卡一致性的依据。
+- `erratum_batch / erratum_item`：勘误批次与明细（A/B 卷勘误前后字母）；勘误提交为单事务，校验不过整体回滚。
+
+## 目录结构
+
+```
+server/
+  app.py              # Flask 路由与封存/勘误事务
+  db.py               # SQLite 连接与建表
+  templates/index.html
+  static/app.js       # 原生 JS：编排、封存回看、打印视图、勘误
+  static/style.css    # 含 @media print 打印样式
+Dockerfile
+docker-compose.yml
+requirements.txt
+```
