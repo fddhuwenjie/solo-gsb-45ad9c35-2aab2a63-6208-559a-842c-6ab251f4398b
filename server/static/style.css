@@ -137,6 +137,24 @@ table.data th { background: #f6f8fb; }
 .note-box { border-left: 3px solid var(--warn); background: #fdf8ec; padding: 8px 12px; font-size: 13px; margin: 10px 0; }
 .erratum-form .rowbox { border: 1px dashed var(--line); border-radius: 8px; padding: 10px 14px; margin: 8px 0; }
 
+/* answer-card registration & review */
+.card-input-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(108px, 1fr));
+  gap: 8px 14px; margin-top: 6px;
+}
+.card-input-cell {
+  display: flex; align-items: center; gap: 6px;
+  border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; background: #fafbfc;
+}
+.card-input-cell label { margin: 0; white-space: nowrap; color: var(--ink); font-size: 13px; }
+.card-input-cell input { width: 42px; padding: 4px 6px; text-align: center; text-transform: uppercase; }
+.card-input-cell .small { white-space: nowrap; }
+
+.scoreline { display: flex; align-items: center; gap: 22px; flex-wrap: wrap; margin: 10px 0 4px; font-size: 15px; }
+.score-registered { color: var(--brand-dark); font-size: 18px; }
+.score-current { color: var(--ok); font-size: 18px; }
+.score-changed { font-weight: 700; color: var(--err); background: #fdf0f0; }
+
 @media print {
   body { background: #fff; }
   .topbar, .toolbar, .tabs, .no-print, #toast { display: none !important; }

@@ -371,6 +371,9 @@ def _seal_summary(db, seal_row):
     s["erratum_count"] = db.execute(
         "SELECT COUNT(*) c FROM erratum_batch WHERE seal_id = ?", (s["id"],)
     ).fetchone()["c"]
+    s["card_count"] = db.execute(
+        "SELECT COUNT(*) c FROM answer_card WHERE seal_id = ?", (s["id"],)
+    ).fetchone()["c"]
     return s
 
 
@@ -611,6 +614,219 @@ def create_errata(seal_id):
             for p in prepared
         ],
     })
+
+
+# ---------------------------------------------------------------------------
+# answer-card registration & post-erratum score review
+# ---------------------------------------------------------------------------
+
+def _paper_key(db, seal_id, paper_name):
+    """number -> {pq_id, sq_id, correct_so_id, letter_to_so} for one paper."""
+    prow = db.execute(
+        "SELECT id FROM paper WHERE seal_id = ? AND name = ?", (seal_id, paper_name)
+    ).fetchone()
+    if prow is None:
+        return None
+    questions = {}
+    for pq in db.execute(
+        "SELECT id, number, sealed_question_id FROM paper_question "
+        "WHERE paper_id = ? ORDER BY number", (prow["id"],)
+    ).fetchall():
+        sq = db.execute(
+            "SELECT correct_sealed_option_id FROM sealed_question WHERE id = ?",
+            (pq["sealed_question_id"],),
+        ).fetchone()
+        letter_to_so = {}
+        for po in db.execute(
+            "SELECT letter, sealed_option_id FROM paper_option WHERE paper_question_id = ?",
+            (pq["id"],),
+        ).fetchall():
+            letter_to_so[po["letter"]] = po["sealed_option_id"]
+        questions[pq["number"]] = {
+            "pq_id": pq["id"],
+            "sq_id": pq["sealed_question_id"],
+            "correct_so_id": sq["correct_sealed_option_id"],
+            "letter_to_so": letter_to_so,
+        }
+    return questions
+
+
+def _card_row(db, card_id):
+    return db.execute(
+        "SELECT id, seal_id, paper_name, candidate_code, registered_total, created_at "
+        "FROM answer_card WHERE id = ?", (card_id,)
+    ).fetchone()
+
+
+def _card_detail(db, card_id, seal_id=None):
+    """Registered card plus its always-current re-scoring against the key."""
+    card = _card_row(db, card_id)
+    if card is None or (seal_id is not None and card["seal_id"] != seal_id):
+        raise ApiError(404, "答题卡不存在")
+    d = dict(card)
+    items = []
+    current_total = 0
+    for r in db.execute(
+        """SELECT aci.number, aci.chosen_sealed_option_id, aci.registered_score,
+                  pq.sealed_question_id, sq.stable_code AS question_code,
+                  sq.correct_sealed_option_id,
+                  po_ch.letter AS chosen_letter,
+                  po_cur.letter AS current_letter
+             FROM answer_card_item aci
+             JOIN paper_question pq ON pq.id = aci.paper_question_id
+             JOIN sealed_question sq ON sq.id = pq.sealed_question_id
+             LEFT JOIN paper_option po_ch ON po_ch.paper_question_id = pq.id
+                  AND po_ch.sealed_option_id = aci.chosen_sealed_option_id
+             LEFT JOIN paper_option po_cur ON po_cur.paper_question_id = pq.id
+                  AND po_cur.sealed_option_id = sq.correct_sealed_option_id
+            WHERE aci.card_id = ? ORDER BY aci.number""",
+        (card_id,),
+    ).fetchall():
+        it = dict(r)
+        it["blank"] = it["chosen_sealed_option_id"] is None
+        # Re-score against the answer key as it stands now (errata flip it).
+        it["current_score"] = (
+            1 if not it["blank"]
+            and it["chosen_sealed_option_id"] == it["correct_sealed_option_id"]
+            else 0
+        )
+        it["changed"] = it["current_score"] != it["registered_score"]
+        current_total += it["current_score"]
+        items.append(it)
+    d["question_count"] = len(items)
+    d["current_total"] = current_total
+    d["changed_count"] = sum(1 for it in items if it["changed"])
+    d["items"] = items
+    d["changed_items"] = [
+        {"number": it["number"], "question_code": it["question_code"],
+         "registered_score": it["registered_score"], "current_score": it["current_score"],
+         "chosen_letter": it["chosen_letter"],
+         "registered_letter": it["chosen_letter"],
+         "current_letter": it["current_letter"]}
+        for it in items if it["changed"]
+    ]
+    return d
+
+
+@app.post("/api/seals/<int:seal_id>/cards")
+def register_card(seal_id):
+    data = payload()
+    paper_name = data.get("paper")
+    if paper_name not in ("A", "B"):
+        raise ApiError(400, "请选择 A 卷或 B 卷")
+    candidate_code = require_text(data, "candidate_code", "考生编号")
+    answers_raw = data.get("answers")
+    if not isinstance(answers_raw, list):
+        raise ApiError(400, "作答必须是逐题答案列表")
+
+    db = get_db()
+    if db.execute("SELECT 1 FROM seal WHERE id = ?", (seal_id,)).fetchone() is None:
+        raise ApiError(404, "封存卷不存在")
+
+    questions = _paper_key(db, seal_id, paper_name)
+    if not questions:
+        raise ApiError(400, f"{paper_name} 卷没有题目，无法登记答题卡")
+
+    # ---- phase 1: validate every entry, write nothing --------------------
+    if db.execute(
+        "SELECT 1 FROM answer_card WHERE seal_id = ? AND candidate_code = ?",
+        (seal_id, candidate_code),
+    ).fetchone() is not None:
+        raise ApiError(409, f"考生 {candidate_code} 在本封存版本已登记过答题卡，不能重复登记")
+
+    prepared = {}
+    for idx, ans in enumerate(answers_raw, start=1):
+        if not isinstance(ans, dict):
+            raise ApiError(400, f"第 {idx} 条作答格式错误")
+        number = ans.get("number")
+        if not isinstance(number, int) or isinstance(number, bool):
+            raise ApiError(400, f"第 {idx} 条作答：题号必须是整数")
+        if number not in questions:
+            raise ApiError(400, f"题号 {number} 不属于 {paper_name} 卷（多余题号），整张拒绝")
+        if number in prepared:
+            raise ApiError(400, f"题号 {number} 重复出现，整张拒绝")
+        raw_letter = ans.get("letter")
+        if raw_letter is None:
+            letter = ""
+        elif isinstance(raw_letter, str):
+            letter = raw_letter.strip().upper()
+        else:
+            raise ApiError(400, f"第 {number} 题：作答字母必须是 A–D 或留空")
+        if letter == "":
+            chosen_so_id = None
+        else:
+            chosen_so_id = questions[number]["letter_to_so"].get(letter)
+            if chosen_so_id is None:
+                raise ApiError(400, f"第 {number} 题：该卷没有字母 {letter} 选项，整张拒绝")
+        registered_score = (
+            1 if chosen_so_id is not None
+            and chosen_so_id == questions[number]["correct_so_id"] else 0
+        )
+        prepared[number] = (chosen_so_id, registered_score)
+
+    missing = sorted(set(questions) - set(prepared))
+    if missing:
+        raise ApiError(400, "缺少题号 " + "、".join(map(str, missing)) + "，整张拒绝")
+
+    # ---- phase 2: commit --------------------------------------------------
+    try:
+        cur = db.execute(
+            "INSERT INTO answer_card (seal_id, paper_name, candidate_code, registered_total) "
+            "VALUES (?, ?, ?, ?)",
+            (seal_id, paper_name, candidate_code,
+             sum(score for _, score in prepared.values())),
+        )
+        card_id = cur.lastrowid
+        for number in sorted(prepared):
+            chosen_so_id, score = prepared[number]
+            db.execute(
+                "INSERT INTO answer_card_item "
+                "(card_id, paper_question_id, number, chosen_sealed_option_id, registered_score) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (card_id, questions[number]["pq_id"], number, chosen_so_id, score),
+            )
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        raise ApiError(409, f"考生 {candidate_code} 在本封存版本已登记过答题卡，不能重复登记")
+    except sqlite3.DatabaseError as exc:
+        db.rollback()
+        raise ApiError(500, f"登记写入失败，已回滚，未留下记录：{exc}")
+
+    return jsonify({"ok": True, "card": _card_detail(db, card_id, seal_id)})
+
+
+@app.get("/api/seals/<int:seal_id>/cards")
+def list_cards(seal_id):
+    db = get_db()
+    if db.execute("SELECT 1 FROM seal WHERE id = ?", (seal_id,)).fetchone() is None:
+        raise ApiError(404, "封存卷不存在")
+    cards = []
+    for ac in db.execute(
+        "SELECT id, seal_id, paper_name, candidate_code, registered_total, created_at "
+        "FROM answer_card WHERE seal_id = ? ORDER BY id", (seal_id,)
+    ).fetchall():
+        d = dict(ac)
+        d["question_count"] = db.execute(
+            "SELECT COUNT(*) c FROM answer_card_item WHERE card_id = ?", (ac["id"],)
+        ).fetchone()["c"]
+        d["current_total"] = db.execute(
+            """SELECT COUNT(*) c
+                 FROM answer_card_item aci
+                 JOIN paper_question pq ON pq.id = aci.paper_question_id
+                 JOIN sealed_question sq ON sq.id = pq.sealed_question_id
+                WHERE aci.card_id = ?
+                  AND aci.chosen_sealed_option_id IS sq.correct_sealed_option_id""",
+            (ac["id"],),
+        ).fetchone()["c"]
+        d["changed"] = d["current_total"] != d["registered_total"]
+        cards.append(d)
+    return jsonify({"ok": True, "cards": cards})
+
+
+@app.get("/api/seals/<int:seal_id>/cards/<int:card_id>")
+def get_card(seal_id, card_id):
+    return jsonify({"ok": True, "card": _card_detail(get_db(), card_id, seal_id)})
 
 
 # ---------------------------------------------------------------------------

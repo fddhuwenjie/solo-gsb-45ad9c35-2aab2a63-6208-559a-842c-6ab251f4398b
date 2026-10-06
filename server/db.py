@@ -117,6 +117,34 @@ CREATE TABLE IF NOT EXISTS erratum_item (
     paper_b_old_letter       TEXT,
     paper_b_new_letter       TEXT
 );
+
+-- Registered answer card: at most one card per candidate per sealed
+-- revision (whichever paper, A or B, was sat).  Answers are stored as the
+-- sealed-option snapshot chosen through that paper's printed number/letter,
+-- together with the score at registration time; the current score is always
+-- re-derived from the (possibly errata-corrected) sealed answer key, so
+-- later bank edits or other seals can never touch a registered card.
+CREATE TABLE IF NOT EXISTS answer_card (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    seal_id             INTEGER NOT NULL REFERENCES seal(id) ON DELETE CASCADE,
+    paper_name          TEXT NOT NULL CHECK(paper_name IN ('A', 'B')),
+    candidate_code      TEXT NOT NULL,
+    registered_total    INTEGER NOT NULL,
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(seal_id, candidate_code)
+);
+CREATE TABLE IF NOT EXISTS answer_card_item (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    card_id                  INTEGER NOT NULL
+        REFERENCES answer_card(id) ON DELETE CASCADE,
+    paper_question_id        INTEGER NOT NULL
+        REFERENCES paper_question(id) ON DELETE CASCADE,
+    number                   INTEGER NOT NULL,
+    chosen_sealed_option_id  INTEGER
+        REFERENCES sealed_option(id) ON DELETE CASCADE,  -- NULL = left blank
+    registered_score         INTEGER NOT NULL CHECK(registered_score IN (0, 1)),
+    UNIQUE(card_id, number)
+);
 """
 
 

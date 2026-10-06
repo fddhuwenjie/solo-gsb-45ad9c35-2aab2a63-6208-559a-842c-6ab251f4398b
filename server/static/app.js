@@ -82,6 +82,11 @@ function renderHome() {
         h("h3", null, "④ 提交勘误"),
         h("p", { class: "small muted" }, "按封存题目和当时印出的选项修正答案，同时更新两卷答案表；非法提交整次拒绝、原答案不变。"),
         h("a", { class: "btn ghost", href: "#/seals" }, "去封存卷页操作")
+      ),
+      h("div", { class: "card" },
+        h("h3", null, "⑤ 作答登记与成绩复核"),
+        h("p", { class: "small muted" }, "封存详情页按 A/B 卷印出的题号与字母逐题登记答题卡（可留空）；登记成绩冻结，勘误后自动重算当前成绩并列出得分变化。"),
+        h("a", { class: "btn ghost", href: "#/seals" }, "去封存卷页登记")
       )
     )
   );
@@ -353,9 +358,12 @@ async function renderSeals() {
         h("td", null, s.erratum_count > 0
           ? h("span", { class: "pill warn" }, s.erratum_count + " 次勘误")
           : h("span", { class: "pill ok" }, "无勘误")),
+        h("td", null, s.card_count > 0
+          ? h("span", { class: "pill" }, s.card_count + " 张答题卡")
+          : h("span", { class: "muted small" }, "未登记")),
         h("td", null, s.created_at),
         h("td", null, h("a", { class: "btn mini", href: `#/seals/${s.id}` }, "回看 / 打印 / 勘误"))))
-    : [h("tr", null, h("td", { colspan: "6", class: "muted" }, "尚无封存卷，请先到「A/B 卷编排」封存。"))];
+    : [h("tr", null, h("td", { colspan: "7", class: "muted" }, "尚无封存卷，请先到「A/B 卷编排」封存。"))];
 
   view.replaceChildren(
     h("h1", null, "封存卷与勘误"),
@@ -363,13 +371,13 @@ async function renderSeals() {
       h("table", { class: "data" },
         h("thead", null, h("tr", null,
           h("th", null, "版本"), h("th", null, "备注"), h("th", null, "题量"),
-          h("th", null, "勘误"), h("th", null, "封存时间"), h("th", null, "操作"))),
+          h("th", null, "勘误"), h("th", null, "作答登记"), h("th", null, "封存时间"), h("th", null, "操作"))),
         h("tbody", null, ...rows))));
 }
 
 /* ------------------------------------------------------- seal detail */
 
-const sealState = { detail: null, errata: [], tab: "paperA" };
+const sealState = { detail: null, errata: [], cards: [], tab: "paperA" };
 
 function sheetHeader(subtitle) {
   const s = sealState.detail;
@@ -579,11 +587,179 @@ function errataHistoryPanel() {
   return card;
 }
 
+/* ------------------------------------------------ answer-card register */
+
+function registerPanel() {
+  const s = sealState.detail;
+  const result = h("div");
+  const paperSel = h("select", {},
+    h("option", { value: "A" }, "A 卷"), h("option", { value: "B" }, "B 卷"));
+  const candidate = h("input", { type: "text", placeholder: "考生编号（同一封存版本只能登记一张）" });
+  const grid = h("div", { class: "card-input-grid" });
+
+  function buildRows() {
+    const paper = paperSel.value;
+    grid.replaceChildren();
+    s.papers[paper].questions.forEach(q => {
+      const inp = h("input", {
+        type: "text", maxlength: "1", placeholder: "留空",
+        "data-number": String(q.number),
+      });
+      inp.addEventListener("input", () => {
+        inp.value = inp.value.toUpperCase().replace(/[^A-D]/g, "");
+      });
+      const cell = h("div", { class: "card-input-cell" },
+        h("label", null, "第 " + q.number + " 题"),
+        inp,
+        h("span", { class: "small muted" }, q.stable_code));
+      grid.appendChild(cell);
+    });
+  }
+  paperSel.addEventListener("change", buildRows);
+  buildRows();
+
+  const panel = h("div", { class: "card screen-only" },
+    h("h3", null, "作答登记"),
+    h("p", { class: "small muted" },
+      "选择考生所答的 A 或 B 卷，输入考生编号，并按该卷印出的题号逐题填写选项字母（可留空）。",
+      "每题 1 分、空白 0 分；登记时同时保存所选封存选项与逐题得分。",
+      "同一考生在本封存版本只能登记一张；题号缺失、重复、多余或字母不属于该题时整张拒绝、不留下记录。"),
+    h("div", { class: "grid2" },
+      h("div", null, h("label", null, "考生作答卷别"), paperSel),
+      h("div", null, h("label", null, "考生编号"), candidate)),
+    h("label", { style: "margin-top:12px" }, "逐题作答字母"),
+    grid,
+    h("div", { class: "toolbar" },
+      h("button", {
+        onclick: async () => {
+          const paper = paperSel.value;
+          const answers = [...grid.querySelectorAll("input")].map(i => ({
+            number: Number(i.dataset.number),
+            letter: i.value.trim() || null,
+          }));
+          result.replaceChildren();
+          try {
+            const r = await api("POST", `/api/seals/${s.id}/cards`, {
+              paper, candidate_code: candidate.value.trim(), answers,
+            });
+            toast(`登记成功：登记成绩 ${r.card.registered_total} 分`, "ok");
+            await loadSeal(s.id, "review");
+            viewCard(s.id, r.card.id);
+          } catch (e) {
+            result.replaceChildren(h("p", { class: "pill err" },
+              "整张拒绝，未留下任何记录：" + e.message));
+          }
+        }
+      }, "登记答题卡"),
+      h("button", {
+        class: "ghost",
+        onclick: () => { grid.querySelectorAll("input").forEach(i => { i.value = ""; }); }
+      }, "清空作答")),
+    result);
+  return panel;
+}
+
+/* ------------------------------------------------ score review */
+
+function scorePill(registered, current) {
+  if (registered === current) return h("span", { class: "pill" }, "无变化");
+  return current > registered
+    ? h("span", { class: "pill ok" }, `↑ +${current - registered}`)
+    : h("span", { class: "pill err" }, `↓ ${current - registered}`);
+}
+
+async function viewCard(sealId, cardId) {
+  let card;
+  try {
+    card = (await api("GET", `/api/seals/${sealId}/cards/${cardId}`)).card;
+  } catch (e) { toast(e.message, "err"); return; }
+  const host = document.getElementById("card-detail");
+  host.replaceChildren();
+
+  const head = h("div", { class: "card screen-only" },
+    h("h3", null, `考生 ${card.candidate_code} 的答题卡（${card.paper_name} 卷）`),
+    h("p", { class: "small muted" },
+      "登记于 " + card.created_at +
+      "；作答与登记成绩永久冻结，后续勘误只重算“当前成绩”。",
+      "修改题库或其他封存版本均不影响本卡。"),
+    h("div", { class: "scoreline" },
+      h("span", null, "登记成绩：", h("strong", { class: "score-registered" },
+        `${card.registered_total} / ${card.question_count}`)),
+      h("span", null, "当前成绩：", h("strong", { class: "score-current" },
+        `${card.current_total} / ${card.question_count}`)),
+      scorePill(card.registered_total, card.current_total)),
+  );
+  if (card.changed_items.length) {
+    head.appendChild(h("div", { class: "note-box" },
+      "勘误导致得分变化的题号：" + card.changed_items.map(it =>
+        `第${it.number}题 ${it.registered_score}→${it.current_score} 分`
+      ).join("；") + "。"));
+  } else {
+    head.appendChild(h("p", { class: "small muted", style: "margin:6px 0 0" },
+      "暂无因勘误而变化的题目。"));
+  }
+
+  const trs = card.items.map(it => h("tr", null,
+    h("td", null, String(it.number)),
+    h("td", null, h("span", { class: "qcode" }, it.question_code || "")),
+    h("td", null, it.blank ? h("span", { class: "muted" }, "（留空）") : it.chosen_letter),
+    h("td", null, it.current_letter || "—"),
+    h("td", null, String(it.registered_score)),
+    h("td", { class: it.changed ? "score-changed" : "" }, String(it.current_score))));
+  const tableCard = h("div", { class: "card screen-only" },
+    h("h3", null, "逐题复核"),
+    h("table", { class: "data" },
+      h("thead", null, h("tr", null,
+        h("th", null, "题号"), h("th", null, "封存题目"),
+        h("th", null, "原作答字母"), h("th", null, "当前正确字母"),
+        h("th", null, "登记得分"), h("th", null, "当前得分"))),
+      h("tbody", null, ...trs)));
+
+  host.replaceChildren(
+    h("div", { class: "toolbar no-print" },
+      h("button", { class: "mini ghost", onclick: () => host.replaceChildren() }, "收起答题卡")),
+    head, tableCard);
+}
+
+function reviewPanel() {
+  const s = sealState.detail;
+  const panel = h("div", { class: "card screen-only" },
+    h("h3", null, "成绩复核"),
+    h("p", { class: "small muted" },
+      "回看已登记答题卡：登记成绩按封存时答案记录且不再改变；当前成绩按原作答对应的封存选项、",
+      "对照现行答案（含历次勘误）重新核分。多次勘误可使成绩上升、下降或恢复；失败的勘误不影响复核结果。"));
+
+  if (!sealState.cards.length) {
+    panel.appendChild(h("p", { class: "muted small" }, "本封存版本尚无作答登记。"));
+    panel.appendChild(h("button", {
+      class: "ghost", onclick: () => { sealState.tab = "register"; renderSealDetailBody(); }
+    }, "去“作答登记”标签"));
+    return h("div", null, panel, h("div", { id: "card-detail" }));
+  }
+
+  const rows = sealState.cards.map(c => h("tr", null,
+    h("td", null, h("span", { class: "qcode" }, c.candidate_code)),
+    h("td", null, c.paper_name + " 卷"),
+    h("td", null, String(c.registered_total)),
+    h("td", { class: c.changed ? "score-changed" : "" }, String(c.current_total)),
+    h("td", null, scorePill(c.registered_total, c.current_total)),
+    h("td", null, c.created_at),
+    h("td", null, h("button", { class: "mini", onclick: () => viewCard(s.id, c.id) }, "回看答题卡"))));
+  panel.appendChild(h("table", { class: "data" },
+    h("thead", null, h("tr", null,
+      h("th", null, "考生编号"), h("th", null, "卷别"),
+      h("th", null, "登记成绩"), h("th", null, "当前成绩"),
+      h("th", null, "变化"), h("th", null, "登记时间"), h("th", null, "操作"))),
+    h("tbody", null, ...rows)));
+  return h("div", null, panel, h("div", { id: "card-detail" }));
+}
+
 function renderSealTabs() {
   const tabs = [
     ["paperA", "A 卷试卷"], ["cardA", "A 卷答题卡"], ["keyA", "A 卷答案表"],
     ["paperB", "B 卷试卷"], ["cardB", "B 卷答题卡"], ["keyB", "B 卷答案表"],
     ["errata", "勘误"],
+    ["register", "作答登记"], ["review", "成绩复核"],
   ];
   const bar = h("div", { class: "tabs no-print" });
   tabs.forEach(([key, label]) => {
@@ -618,6 +794,8 @@ function renderSealDetailBody() {
     case "cardB": content.appendChild(answerCardSheet("B")); break;
     case "keyB": content.appendChild(keySheet("B")); break;
     case "errata": content.appendChild(erratumFormPanel()); content.appendChild(errataHistoryPanel()); break;
+    case "register": content.appendChild(registerPanel()); break;
+    case "review": content.appendChild(reviewPanel()); break;
   }
   host.appendChild(content);
 }
@@ -627,7 +805,12 @@ async function loadSeal(id, tab) {
   view.replaceChildren(h("p", null, "加载中…"));
   try {
     sealState.detail = (await api("GET", `/api/seals/${id}`)).seal;
-    sealState.errata = (await api("GET", `/api/seals/${id}/errata`)).batches;
+    const [errataRes, cardsRes] = await Promise.all([
+      api("GET", `/api/seals/${id}/errata`),
+      api("GET", `/api/seals/${id}/cards`),
+    ]);
+    sealState.errata = errataRes.batches;
+    sealState.cards = cardsRes.cards;
   } catch (e) { view.replaceChildren(h("p", { class: "pill err" }, e.message)); return; }
   if (tab) sealState.tab = tab;
   view.replaceChildren(
