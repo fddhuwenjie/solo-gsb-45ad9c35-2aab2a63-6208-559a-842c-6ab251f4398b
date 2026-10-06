@@ -61,7 +61,7 @@ function renderHome() {
   setActiveNav("home");
   view.replaceChildren(
     h("h1", null, "本地双卷印发校核"),
-    h("p", { class: "muted" }, "单选题库 → 分别编排 A、B 卷 → 同一题库修订封存 → 打印试卷 / 答题卡 / 答案表 → 勘误并同步两卷答案。"),
+    h("p", { class: "muted" }, "单选题库 → 分别编排 A、B 卷 → 同一题库修订封存 → 打印试卷 / 答题卡 / 答案表 → 勘误并同步两卷答案 → 登记答题卡并按勘误复核成绩。"),
     h("div", { class: "grid2" },
       h("div", { class: "card" },
         h("h3", null, "① 维护题库"),
@@ -81,6 +81,11 @@ function renderHome() {
       h("div", { class: "card" },
         h("h3", null, "④ 提交勘误"),
         h("p", { class: "small muted" }, "按封存题目和当时印出的选项修正答案，同时更新两卷答案表；非法提交整次拒绝、原答案不变。"),
+        h("a", { class: "btn ghost", href: "#/seals" }, "去封存卷页操作")
+      ),
+      h("div", { class: "card" },
+        h("h3", null, "⑤ 登记答题卡与复核"),
+        h("p", { class: "small muted" }, "按封存卷印出的题号登记考生作答（每题 1 分、空白 0 分）；勘误后按原作答的封存选项重新核分，对照登记成绩与当前成绩。"),
         h("a", { class: "btn ghost", href: "#/seals" }, "去封存卷页操作")
       )
     )
@@ -370,6 +375,7 @@ async function renderSeals() {
 /* ------------------------------------------------------- seal detail */
 
 const sealState = { detail: null, errata: [], tab: "paperA" };
+const sheetState = { list: [], detail: null, paper: "A" };
 
 function sheetHeader(subtitle) {
   const s = sealState.detail;
@@ -579,11 +585,148 @@ function errataHistoryPanel() {
   return card;
 }
 
+/* ------------------------------------------------------- answer sheets */
+
+function sheetRegisterPanel() {
+  const s = sealState.detail;
+  const paperSel = h("select", {},
+    h("option", { value: "A" }, "A 卷"),
+    h("option", { value: "B" }, "B 卷"));
+  paperSel.value = sheetState.paper;
+  const examinee = h("input", { type: "text", placeholder: "考生编号" });
+  const grid = h("div", { class: "sheet-grid" });
+  const result = h("div");
+
+  function buildGrid() {
+    const p = s.papers[paperSel.value];
+    grid.replaceChildren();
+    p.questions.forEach(q => {
+      const sel = h("select", { "data-number": q.number },
+        h("option", { value: "" }, "（空白）"),
+        ...LETTERS.map(L => h("option", { value: L }, L)));
+      grid.appendChild(h("div", { class: "sheet-cell" },
+        h("label", null, `第 ${q.number} 题`), sel));
+    });
+  }
+  paperSel.addEventListener("change", () => { sheetState.paper = paperSel.value; buildGrid(); });
+  buildGrid();
+
+  return h("div", { class: "card screen-only" },
+    h("h3", null, "登记答题卡"),
+    h("p", { class: "small muted" },
+      "按所选卷别印出的题号逐题选择作答字母，可留空（空白计 0 分，每题 1 分）。" +
+      "同一考生在同一封存版本只能登记一张；题号缺失、重复、多余或字母不属于该题时整张拒绝。"),
+    h("div", { class: "grid2" },
+      h("div", null, h("label", null, "卷别"), paperSel),
+      h("div", null, h("label", null, "考生编号"), examinee)),
+    h("label", null, "逐题作答（不选即为空白）"),
+    grid,
+    h("div", { class: "toolbar" },
+      h("button", {
+        onclick: async () => {
+          const answers = [...grid.querySelectorAll("select")].map(sel => ({
+            number: Number(sel.dataset.number),
+            letter: sel.value || null,
+          }));
+          result.replaceChildren();
+          try {
+            const r = await api("POST", `/api/seals/${s.id}/sheets`, {
+              paper: paperSel.value, examinee: examinee.value, answers });
+            toast(`已登记，考生 ${examinee.value.trim()} 得分 ${r.total_score}`, "ok");
+            await refreshSheets();
+          } catch (e) {
+            result.replaceChildren(h("p", { class: "pill err" }, "整张拒绝，未留下记录：" + e.message));
+          }
+        }
+      }, "登记答题卡")),
+    result);
+}
+
+async function refreshSheets() {
+  sheetState.list = (await api("GET", `/api/seals/${sealState.detail.id}/sheets`)).sheets;
+  sheetState.detail = null;
+  renderSealDetailBody();
+}
+
+function sheetListPanel() {
+  const card = h("div", { class: "card screen-only" }, h("h3", null, "已登记答题卡"));
+  if (!sheetState.list.length) {
+    card.appendChild(h("p", { class: "muted small" }, "尚无登记。"));
+    return card;
+  }
+  const rows = sheetState.list.map(sh => {
+    const diff = sh.current_total !== sh.total_score;
+    return h("tr", null,
+      h("td", null, sh.examinee),
+      h("td", null, sh.paper + " 卷"),
+      h("td", null, String(sh.total_score)),
+      h("td", null, h("span", { class: "pill " + (diff ? "warn" : "ok") }, String(sh.current_total))),
+      h("td", null, sh.created_at),
+      h("td", null, h("button", {
+        class: "mini ghost",
+        onclick: async () => {
+          try {
+            sheetState.detail = (await api(
+              "GET", `/api/seals/${sealState.detail.id}/sheets/${sh.id}`));
+            renderSealDetailBody();
+          } catch (e) { toast(e.message, "err"); }
+        }
+      }, "查看复核")));
+  });
+  card.appendChild(h("table", { class: "data" },
+    h("thead", null, h("tr", null,
+      h("th", null, "考生编号"), h("th", null, "卷别"), h("th", null, "登记成绩"),
+      h("th", null, "当前成绩"), h("th", null, "登记时间"), h("th", null, "操作"))),
+    h("tbody", null, ...rows)));
+  card.appendChild(h("p", { class: "small muted" },
+    "当前成绩按最新答案表（含历次勘误）对原作答的封存选项重新核分；登记成绩与作答记录不变。"));
+  return card;
+}
+
+function sheetDetailPanel() {
+  const d = sheetState.detail;
+  const sh = d.sheet;
+  const diff = sh.current_total !== sh.total_score;
+  const card = h("div", { class: "card" },
+    h("h3", null, `答题卡复核 · 考生 ${sh.examinee} · ${sh.paper} 卷`),
+    h("p", { class: "small muted" }, `登记时间 ${sh.created_at}`),
+    h("p", null,
+      "登记成绩 ", h("span", { class: "pill ok" }, sh.total_score + " 分"),
+      "　当前成绩 ", h("span", { class: "pill " + (diff ? "warn" : "ok") }, sh.current_total + " 分")));
+  if (d.changes.length) {
+    card.appendChild(h("div", { class: "note-box" },
+      "勘误后得分变化：" + d.changes
+        .map(c => `第 ${c.number} 题 ${c.before} → ${c.after}`).join("；")));
+  } else {
+    card.appendChild(h("p", { class: "small muted" }, "历次勘误未改变本张答题卡的逐题得分。"));
+  }
+  const rows = d.items.map(it => {
+    const changed = it.registered_score !== it.current_score;
+    return h("tr", changed ? { class: "changed" } : null,
+      h("td", null, String(it.number)),
+      h("td", null, it.letter || "（空白）"),
+      h("td", null, h("span", { class: "ocode" }, it.option_code || "—")),
+      h("td", null, String(it.registered_score)),
+      h("td", null, String(it.current_score)));
+  });
+  card.appendChild(h("table", { class: "data" },
+    h("thead", null, h("tr", null,
+      h("th", null, "题号"), h("th", null, "作答字母"), h("th", null, "封存选项"),
+      h("th", null, "登记得分"), h("th", null, "当前得分"))),
+    h("tbody", null, ...rows)));
+  card.appendChild(h("div", { class: "toolbar no-print" },
+    h("button", {
+      class: "ghost",
+      onclick: () => { sheetState.detail = null; renderSealDetailBody(); }
+    }, "← 返回列表")));
+  return card;
+}
+
 function renderSealTabs() {
   const tabs = [
     ["paperA", "A 卷试卷"], ["cardA", "A 卷答题卡"], ["keyA", "A 卷答案表"],
     ["paperB", "B 卷试卷"], ["cardB", "B 卷答题卡"], ["keyB", "B 卷答案表"],
-    ["errata", "勘误"],
+    ["errata", "勘误"], ["sheets", "作答登记 / 复核"],
   ];
   const bar = h("div", { class: "tabs no-print" });
   tabs.forEach(([key, label]) => {
@@ -618,6 +761,14 @@ function renderSealDetailBody() {
     case "cardB": content.appendChild(answerCardSheet("B")); break;
     case "keyB": content.appendChild(keySheet("B")); break;
     case "errata": content.appendChild(erratumFormPanel()); content.appendChild(errataHistoryPanel()); break;
+    case "sheets":
+      if (sheetState.detail) {
+        content.appendChild(sheetDetailPanel());
+      } else {
+        content.appendChild(sheetRegisterPanel());
+        content.appendChild(sheetListPanel());
+      }
+      break;
   }
   host.appendChild(content);
 }
@@ -628,6 +779,8 @@ async function loadSeal(id, tab) {
   try {
     sealState.detail = (await api("GET", `/api/seals/${id}`)).seal;
     sealState.errata = (await api("GET", `/api/seals/${id}/errata`)).batches;
+    sheetState.list = (await api("GET", `/api/seals/${id}/sheets`)).sheets;
+    sheetState.detail = null;
   } catch (e) { view.replaceChildren(h("p", { class: "pill err" }, e.message)); return; }
   if (tab) sealState.tab = tab;
   view.replaceChildren(

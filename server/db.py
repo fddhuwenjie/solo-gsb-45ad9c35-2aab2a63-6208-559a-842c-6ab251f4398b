@@ -97,6 +97,29 @@ CREATE TABLE IF NOT EXISTS paper_option (
     UNIQUE(paper_question_id, sealed_option_id)
 );
 
+-- Registered answer sheets: one sheet per examinee per seal version.  The
+-- stored sealed_option_id pins each response to the sealed snapshot, so
+-- later bank edits, other seal versions and errata never rewrite the
+-- registered answers or the registered scores.
+CREATE TABLE IF NOT EXISTS answer_sheet (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    seal_id     INTEGER NOT NULL REFERENCES seal(id) ON DELETE CASCADE,
+    paper       TEXT NOT NULL CHECK(paper IN ('A', 'B')),
+    examinee    TEXT NOT NULL,
+    total_score INTEGER NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(seal_id, examinee)
+);
+CREATE TABLE IF NOT EXISTS answer_sheet_item (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    sheet_id          INTEGER NOT NULL REFERENCES answer_sheet(id) ON DELETE CASCADE,
+    paper_question_id INTEGER NOT NULL REFERENCES paper_question(id) ON DELETE CASCADE,
+    letter            TEXT CHECK(letter IN ('A','B','C','D')),  -- NULL = 空白
+    sealed_option_id  INTEGER REFERENCES sealed_option(id),     -- NULL = 空白
+    score             INTEGER NOT NULL CHECK(score IN (0, 1)),
+    UNIQUE(sheet_id, paper_question_id)
+);
+
 -- Erratum batch: all items succeed together or the whole request is refused.
 CREATE TABLE IF NOT EXISTS erratum_batch (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,

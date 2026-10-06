@@ -137,6 +137,11 @@ table.data th { background: #f6f8fb; }
 .note-box { border-left: 3px solid var(--warn); background: #fdf8ec; padding: 8px 12px; font-size: 13px; margin: 10px 0; }
 .erratum-form .rowbox { border: 1px dashed var(--line); border-radius: 8px; padding: 10px 14px; margin: 8px 0; }
 
+/* answer-sheet registration grid & review */
+.sheet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 4px 14px; margin: 4px 0 6px; }
+.sheet-grid .sheet-cell label { margin: 0; }
+table.data tr.changed td { background: #fdf6e3; }
+
 @media print {
   body { background: #fff; }
   .topbar, .toolbar, .tabs, .no-print, #toast { display: none !important; }

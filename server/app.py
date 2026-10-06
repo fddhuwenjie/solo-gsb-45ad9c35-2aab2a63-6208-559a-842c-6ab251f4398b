@@ -614,6 +614,193 @@ def create_errata(seal_id):
 
 
 # ---------------------------------------------------------------------------
+# answer sheets (registration & post-errata review)
+# ---------------------------------------------------------------------------
+
+def _printed_paper(db, seal_id, paper):
+    """Printed questions of one paper: number -> row, plus letter -> sealed option."""
+    questions = {}
+    for r in db.execute(
+        """SELECT pq.id AS pq_id, pq.number, pq.sealed_question_id
+             FROM paper p
+             JOIN paper_question pq ON pq.paper_id = p.id
+            WHERE p.seal_id = ? AND p.name = ?""",
+        (seal_id, paper),
+    ).fetchall():
+        questions[r["number"]] = dict(r)
+    letters = {}  # pq_id -> {letter: sealed_option_id}
+    for r in db.execute(
+        """SELECT po.paper_question_id, po.letter, po.sealed_option_id
+             FROM paper_option po
+            WHERE po.paper_question_id IN
+                  (SELECT pq.id FROM paper_question pq
+                     JOIN paper p ON p.id = pq.paper_id
+                    WHERE p.seal_id = ? AND p.name = ?)""",
+        (seal_id, paper),
+    ).fetchall():
+        letters.setdefault(r["paper_question_id"], {})[r["letter"]] = r["sealed_option_id"]
+    return questions, letters
+
+
+@app.post("/api/seals/<int:seal_id>/sheets")
+def create_sheet(seal_id):
+    data = payload()
+    paper = data.get("paper")
+    if paper not in ("A", "B"):
+        raise ApiError(400, "卷别只支持 A / B")
+    examinee = require_text(data, "examinee", "考生编号")
+    answers = data.get("answers")
+    if not isinstance(answers, list):
+        raise ApiError(400, "answers 应为逐题作答列表")
+
+    db = get_db()
+    if db.execute("SELECT 1 FROM seal WHERE id = ?", (seal_id,)).fetchone() is None:
+        raise ApiError(404, "封存卷不存在")
+    printed, letters = _printed_paper(db, seal_id, paper)
+
+    # ---- validate the whole card first; any problem refuses everything ----
+    cleaned = {}  # number -> letter (None = 空白)
+    for idx, item in enumerate(answers, start=1):
+        if not isinstance(item, dict):
+            raise ApiError(400, f"第 {idx} 条作答格式错误，整张拒绝")
+        number = item.get("number")
+        if isinstance(number, bool) or not isinstance(number, int):
+            raise ApiError(400, f"第 {idx} 条作答：题号格式错误，整张拒绝")
+        if number not in printed:
+            raise ApiError(400, f"题号 {number} 不在 {paper} 卷印出的题号中（多余题号），整张拒绝")
+        if number in cleaned:
+            raise ApiError(400, f"题号 {number} 重复作答，整张拒绝")
+        letter = item.get("letter")
+        if letter is None or (isinstance(letter, str) and not letter.strip()):
+            cleaned[number] = None
+        elif isinstance(letter, str) \
+                and letter.strip().upper() in letters[printed[number]["pq_id"]]:
+            cleaned[number] = letter.strip().upper()
+        else:
+            raise ApiError(400, f"第 {number} 题：作答字母 {letter!r} 不属于该题选项，整张拒绝")
+    missing = [n for n in sorted(printed) if n not in cleaned]
+    if missing:
+        raise ApiError(400, "缺少题号 " + "、".join(map(str, missing)) + " 的作答，整张拒绝")
+
+    if db.execute(
+        "SELECT 1 FROM answer_sheet WHERE seal_id = ? AND examinee = ?",
+        (seal_id, examinee),
+    ).fetchone() is not None:
+        raise ApiError(409, f"考生 {examinee} 在本封存版本已登记过答题卡，不能重复登记")
+
+    # ---- grade against the current key and store in one transaction -------
+    correct_of = {
+        r["id"]: r["correct_sealed_option_id"]
+        for r in db.execute(
+            "SELECT id, correct_sealed_option_id FROM sealed_question WHERE seal_id = ?",
+            (seal_id,),
+        ).fetchall()
+    }
+    try:
+        sheet_id = db.execute(
+            "INSERT INTO answer_sheet (seal_id, paper, examinee, total_score) VALUES (?, ?, ?, 0)",
+            (seal_id, paper, examinee),
+        ).lastrowid
+        total = 0
+        for number in sorted(cleaned):
+            pq = printed[number]
+            letter = cleaned[number]
+            so_id = letters[pq["pq_id"]][letter] if letter else None
+            score = 1 if so_id is not None and so_id == correct_of[pq["sealed_question_id"]] else 0
+            total += score
+            db.execute(
+                """INSERT INTO answer_sheet_item
+                   (sheet_id, paper_question_id, letter, sealed_option_id, score)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (sheet_id, pq["pq_id"], letter, so_id, score),
+            )
+        db.execute("UPDATE answer_sheet SET total_score = ? WHERE id = ?", (total, sheet_id))
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        raise ApiError(409, f"考生 {examinee} 在本封存版本已登记过答题卡，不能重复登记")
+    except sqlite3.DatabaseError:
+        db.rollback()
+        raise ApiError(500, "登记写入失败，已回滚，未留下记录")
+    return jsonify({"ok": True, "sheet_id": sheet_id, "total_score": total})
+
+
+# Current score of every registered item, recomputed live from the stored
+# sealed option against the (possibly errata-updated) answer key.
+_CURRENT_TOTAL_SQL = """
+    (SELECT COUNT(*) FROM answer_sheet_item i
+       JOIN paper_question pq ON pq.id = i.paper_question_id
+       JOIN sealed_question sq ON sq.id = pq.sealed_question_id
+      WHERE i.sheet_id = s.id
+        AND i.sealed_option_id = sq.correct_sealed_option_id)"""
+
+
+@app.get("/api/seals/<int:seal_id>/sheets")
+def list_sheets(seal_id):
+    db = get_db()
+    if db.execute("SELECT 1 FROM seal WHERE id = ?", (seal_id,)).fetchone() is None:
+        raise ApiError(404, "封存卷不存在")
+    sheets = [dict(r) for r in db.execute(
+        f"""SELECT s.id, s.paper, s.examinee, s.total_score, s.created_at,
+                   {_CURRENT_TOTAL_SQL} AS current_total
+              FROM answer_sheet s WHERE s.seal_id = ? ORDER BY s.id""",
+        (seal_id,),
+    ).fetchall()]
+    return jsonify({"ok": True, "sheets": sheets})
+
+
+@app.get("/api/seals/<int:seal_id>/sheets/<int:sheet_id>")
+def get_sheet(seal_id, sheet_id):
+    db = get_db()
+    sheet = db.execute(
+        "SELECT id, paper, examinee, total_score, created_at "
+        "FROM answer_sheet WHERE id = ? AND seal_id = ?",
+        (sheet_id, seal_id),
+    ).fetchone()
+    if sheet is None:
+        raise ApiError(404, "答题卡不存在")
+    items = []
+    changes = []
+    current_total = 0
+    for r in db.execute(
+        """SELECT i.letter, i.score, i.sealed_option_id,
+                  pq.number, so.stable_code AS option_code,
+                  sq.correct_sealed_option_id
+             FROM answer_sheet_item i
+             JOIN paper_question pq ON pq.id = i.paper_question_id
+             JOIN sealed_question sq ON sq.id = pq.sealed_question_id
+             LEFT JOIN sealed_option so ON so.id = i.sealed_option_id
+            WHERE i.sheet_id = ? ORDER BY pq.number""",
+        (sheet_id,),
+    ).fetchall():
+        current = 1 if (r["sealed_option_id"] is not None
+                        and r["sealed_option_id"] == r["correct_sealed_option_id"]) else 0
+        current_total += current
+        items.append({
+            "number": r["number"],
+            "letter": r["letter"],
+            "option_code": r["option_code"],
+            "registered_score": r["score"],
+            "current_score": current,
+        })
+        if current != r["score"]:
+            changes.append({
+                "number": r["number"], "letter": r["letter"],
+                "before": r["score"], "after": current,
+            })
+    return jsonify({
+        "ok": True,
+        "sheet": {
+            "id": sheet["id"], "paper": sheet["paper"], "examinee": sheet["examinee"],
+            "total_score": sheet["total_score"], "current_total": current_total,
+            "created_at": sheet["created_at"],
+        },
+        "items": items,
+        "changes": changes,
+    })
+
+
+# ---------------------------------------------------------------------------
 # pages
 # ---------------------------------------------------------------------------
 
